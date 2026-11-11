@@ -1,0 +1,31 @@
+import {test,expect} from '@playwright/test';
+import {readFileSync} from 'node:fs';
+test('desktop and mobile layout, pricing, booking and admin availability',async({page,request})=>{
+ const errors=[];page.on('pageerror',e=>errors.push(e.message));
+ await page.goto('/');await expect(page.getByRole('heading',{level:1})).toContainText('Photo BoothRentals');
+ await page.setViewportSize({width:1440,height:1000});await page.screenshot({path:'test-results/desktop.png',fullPage:true});
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBeTruthy();
+ await page.setViewportSize({width:390,height:844});await page.screenshot({path:'test-results/mobile.png',fullPage:true});
+ // The rental title and booth share the opening screen; occasions and pricing follow promptly.
+ const positions=await page.evaluate(()=>({title:document.querySelector('h1').getBoundingClientRect().bottom,booth:document.querySelector('.hero-visual').getBoundingClientRect().bottom,events:document.querySelector('#occasions').offsetTop,prices:document.querySelector('#packages').offsetTop,experience:document.querySelector('#experience').offsetTop}));
+ expect(positions.title).toBeLessThan(844);expect(positions.booth).toBeLessThan(844);expect(positions.events).toBeLessThan(600);expect(positions.prices).toBeLessThan(1000);expect(positions.experience).toBeGreaterThan(positions.prices);
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBeTruthy();
+ await page.getByRole('button',{name:'Open menu'}).click();await expect(page.getByRole('navigation',{name:'Main navigation'})).toBeVisible();await page.getByRole('navigation').getByText('Packages',{exact:true}).click();
+ await page.getByRole('button',{name:'Choose prints'}).click();
+ await page.getByLabel('Rental duration').selectOption('5');await expect(page.locator('.booking-total strong')).toHaveText('$540');
+ await page.getByRole('button',{name:'Next month'}).click();const day=page.locator('.calendar-grid button:not([disabled])').first();await day.click();
+ await page.getByLabel('Full name',{exact:true}).fill('Browser Test Guest');await page.getByLabel('Email address',{exact:true}).fill('browser@example.com');await page.getByLabel('Phone number',{exact:true}).fill('2025550123');await page.getByLabel('Venue name & full event address').fill('Example Hall, 100 Main St, Washington DC 20001');await page.locator('.consent input').check();
+ await page.getByRole('button',{name:'Request my date'}).click();await expect(page.getByRole('heading',{name:'Your request is in.'})).toBeVisible();await expect(page.locator('.booking-success')).toContainText('$540');
+ await page.goto('/admin');await page.getByLabel('Admin password').fill('test-only-password-123456');await page.getByRole('button',{name:'Sign in',exact:true}).click();
+ await expect(page.getByText('Browser Test Guest · Wedding')).toBeVisible();await page.getByRole('button',{name:'Confirm booking'}).click();await expect(page.locator('.status')).toHaveText('confirmed');
+ await page.getByRole('button',{name:'calendar',exact:true}).click();await page.getByLabel('Date',{exact:true}).fill('2090-12-20');await page.getByLabel('Internal note').fill('Private event');await page.getByRole('button',{name:'Block date'}).click();await expect(page.getByText('Date blocked.',{exact:true})).toBeVisible();
+ const availability=await request.get('/api/availability');expect((await availability.json()).unavailable).toContain('2090-12-20');
+ await page.getByRole('button',{name:'Unblock'}).click();await expect(page.getByText('Date released.',{exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'pricing',exact:true}).click();await page.getByLabel('3-hour base price ($)').first().fill('280');await page.getByRole('button',{name:'Save pricing'}).click();await expect(page.getByText(/Prices saved/)).toBeVisible();
+ expect((await (await request.get('/api/config')).json()).pricing.digital.base).toBe(280);
+ const badUpload=await page.request.post('/api/admin/media/logo',{multipart:{image:{name:'bad.svg',mimeType:'image/svg+xml',buffer:Buffer.from('<svg/>')}}});expect(badUpload.status()).toBe(400);
+ const upload=await page.request.post('/api/admin/media/hero',{multipart:{image:{name:'booth.png',mimeType:'image/png',buffer:readFileSync('public/booth-hero.png')}}});expect(upload.status()).toBe(200);const {url}=await upload.json();expect((await request.get(url)).status()).toBe(200);expect((await (await request.get('/api/config')).json()).media.hero).toBe(url);
+ await page.getByRole('button',{name:'Sign out'}).click();expect((await request.get('/api/admin/dashboard')).status()).toBe(401);expect(errors).toEqual([]);
+});
+test('API rejects unauthenticated administration, cross-site writes and invalid submissions',async({request})=>{expect((await request.put('/api/admin/pricing',{data:{}})).status()).toBe(401);expect((await request.post('/api/bookings',{data:{}})).status()).toBe(400);expect((await request.post('/api/bookings',{headers:{origin:'https://unrelated.example'},data:{}})).status()).toBe(403);});
+test('small phones, legal pages and reduced motion',async({page})=>{await page.setViewportSize({width:320,height:740});await page.emulateMedia({reducedMotion:'reduce'});await page.goto('/');expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBeTruthy();await page.locator('#packages').scrollIntoViewIfNeeded();await expect(page.getByRole('heading',{name:'Simple prices. Priceless memories.'})).toBeVisible();await page.goto('/privacy');await expect(page.getByRole('heading',{name:'Privacy notice'})).toBeVisible();await page.goto('/terms');await expect(page.getByRole('heading',{name:'Booking terms'})).toBeVisible();});

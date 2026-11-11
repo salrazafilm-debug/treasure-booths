@@ -1,0 +1,47 @@
+import express from 'express';
+import helmet from 'helmet';
+import { rateLimit } from 'express-rate-limit';
+import multer from 'multer';
+import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { z } from 'zod';
+import { createStore, dateSchema } from './store.js';
+
+const root=resolve(dirname(fileURLToPath(import.meta.url)),'..');
+const dataDir=resolve(process.env.DATA_DIR||resolve(root,'data'));
+const store=createStore(dataDir);
+const credentialFile=resolve(dataDir,'admin-password.txt');
+let auth=store.get('auth',null);
+if(!auth){const password=process.env.ADMIN_PASSWORD||randomBytes(24).toString('base64url');if(password.length<12)throw new Error('ADMIN_PASSWORD must have at least 12 characters.');const salt=randomBytes(16).toString('hex');auth={salt,hash:scryptSync(password,salt,64).toString('hex')};store.set('auth',auth);if(!process.env.ADMIN_PASSWORD)writeFileSync(credentialFile,password+'\n',{mode:0o600});}
+const app=express();
+app.disable('x-powered-by');
+app.use(helmet({contentSecurityPolicy:process.env.NODE_ENV==='production'?{directives:{'script-src':["'self'"],'img-src':["'self'",'data:','https://images.unsplash.com'],'style-src':["'self'","'unsafe-inline'",'https://fonts.googleapis.com'],'font-src':["'self'",'https://fonts.gstatic.com'],'upgrade-insecure-requests':null}}:false}));
+app.use(express.json({limit:'32kb'}));
+app.use('/api',(req,res,next)=>{res.set('Cache-Control','no-store');if(!['GET','HEAD','OPTIONS'].includes(req.method)){const origin=req.get('origin');if(origin&&origin!==`${req.protocol}://${req.get('host')}`)return res.status(403).json({error:'Request origin rejected.'});if(req.get('sec-fetch-site')==='cross-site')return res.status(403).json({error:'Cross-site request rejected.'});}next();});
+const hash=v=>createHash('sha256').update(v).digest('hex');
+const session=req=>{const match=req.headers.cookie?.split(';').map(x=>x.trim()).find(x=>x.startsWith('tb_session='));if(!match)return false;const token=match.slice(11);return !!store.db.prepare('SELECT token FROM sessions WHERE token=? AND expires>?').get(hash(token),Date.now());};
+const requireAdmin=(req,res,next)=>session(req)?next():res.status(401).json({error:'Please sign in.'});
+app.get('/api/health',(_,res)=>res.json({ok:true}));
+app.get('/api/config',(_,res)=>res.json({pricing:store.pricing(),media:store.get('media',{})}));
+app.get('/api/availability',(_,res)=>res.json({unavailable:store.unavailable()}));
+app.post('/api/bookings',rateLimit({windowMs:60*60*1000,limit:15,standardHeaders:true,legacyHeaders:false}), (req,res,next)=>{try{res.status(201).json(store.book(req.body));}catch(e){next(e);}});
+app.post('/api/admin/login',rateLimit({windowMs:15*60*1000,limit:10,standardHeaders:true,legacyHeaders:false}), (req,res)=>{const password=req.body?.password;if(typeof password!=='string'||password.length>256)return res.status(400).json({error:'Enter your admin password.'});auth=store.get('auth',null);const valid=timingSafeEqual(scryptSync(password,auth.salt,64),Buffer.from(auth.hash,'hex'));if(!valid)return res.status(401).json({error:'Incorrect password.'});const token=randomBytes(32).toString('hex');store.db.prepare('DELETE FROM sessions WHERE expires<?').run(Date.now());store.db.prepare('INSERT INTO sessions VALUES (?,?)').run(hash(token),Date.now()+8*60*60*1000);res.cookie('tb_session',token,{httpOnly:true,sameSite:'strict',secure:process.env.COOKIE_SECURE==='true',maxAge:8*60*60*1000,path:'/'});res.json({ok:true});});
+app.use('/api/admin',requireAdmin);
+app.post('/api/admin/logout',(req,res)=>{const token=req.headers.cookie?.split(';').map(x=>x.trim()).find(x=>x.startsWith('tb_session='))?.slice(11);if(token)store.db.prepare('DELETE FROM sessions WHERE token=?').run(hash(token));res.clearCookie('tb_session');res.json({ok:true});});
+app.get('/api/admin/dashboard',(_,res)=>res.json({bookings:store.bookings(),blocks:store.db.prepare('SELECT * FROM blocks ORDER BY date').all(),pricing:store.pricing(),media:store.get('media',{})}));
+app.patch('/api/admin/bookings/:id',(req,res,next)=>{try{store.status(req.params.id,z.enum(['pending','confirmed','cancelled']).parse(req.body.status));res.json({ok:true});}catch(e){next(e);}});
+app.post('/api/admin/blocks',(req,res,next)=>{try{const data=z.object({date:dateSchema,note:z.string().trim().max(300).default('Unavailable')}).parse(req.body);if(store.unavailable().includes(data.date))return res.status(409).json({error:'This date is already unavailable.'});store.db.prepare('INSERT INTO blocks VALUES (?,?)').run(data.date,data.note);res.status(201).json({ok:true});}catch(e){next(e);}});
+app.delete('/api/admin/blocks/:date',(req,res,next)=>{try{const date=dateSchema.parse(req.params.date);store.db.prepare('DELETE FROM blocks WHERE date=?').run(date);res.json({ok:true});}catch(e){next(e);}});
+const packageSchema=z.object({name:z.string().trim().min(1).max(70),base:z.number().int().min(1).max(20000),extra:z.number().int().min(1).max(5000)});
+app.put('/api/admin/pricing',(req,res,next)=>{try{store.set('pricing',z.object({digital:packageSchema,prints:packageSchema}).parse(req.body));res.json({ok:true});}catch(e){next(e);}});
+app.put('/api/admin/password',(req,res,next)=>{try{const {password}=z.object({password:z.string().min(12).max(256)}).parse(req.body);const salt=randomBytes(16).toString('hex');store.set('auth',{salt,hash:scryptSync(password,salt,64).toString('hex')});store.db.prepare('DELETE FROM sessions').run();res.clearCookie('tb_session');res.json({ok:true});}catch(e){next(e);}});
+const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:8*1024*1024}});
+mkdirSync(resolve(dataDir,'uploads'),{recursive:true});
+app.post('/api/admin/media/:kind',upload.single('image'),(req,res,next)=>{try{const kind=z.enum(['hero','logo','wedding','party','birthday','graduation','corporate']).parse(req.params.kind);const b=req.file?.buffer;let ext;if(b?.subarray(0,3).equals(Buffer.from([255,216,255])))ext='jpg';else if(b?.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])))ext='png';else if(b?.subarray(0,4).toString()==='RIFF'&&b.subarray(8,12).toString()==='WEBP')ext='webp';if(!ext)return res.status(400).json({error:'Choose a JPG, PNG, or WebP image (maximum 8 MB).'});const filename=kind+'-'+randomBytes(10).toString('hex')+'.'+ext;writeFileSync(resolve(dataDir,'uploads',filename),b,{mode:0o600});const media=store.get('media',{});media[kind]='/media/'+filename;store.set('media',media);res.json({url:media[kind]});}catch(e){next(e);}});
+app.use('/media',express.static(resolve(dataDir,'uploads'),{dotfiles:'deny',index:false}));
+app.use('/api',(req,res)=>res.status(404).json({error:'Endpoint not found.'}));
+app.use((err,req,res,next)=>{if(err instanceof z.ZodError)return res.status(400).json({error:err.issues.map(i=>`${i.path.join('.')}: ${i.message}`).join('; ')});if(err.code==='LIMIT_FILE_SIZE')return res.status(400).json({error:'Image exceeds 8 MB.'});if(err.status)return res.status(err.status).json({error:err.message});console.error('Request failed:',err.name);res.status(500).json({error:'Something went wrong. Please try again.'});});
+if(process.env.NODE_ENV==='production'){if(!existsSync(resolve(root,'dist/index.html')))throw new Error('Run npm run build before npm start.');app.use(express.static(resolve(root,'dist')));app.get('/{*path}',(_,res)=>res.sendFile(resolve(root,'dist/index.html')));}else{const {createServer}=await import('vite');const vite=await createServer({root,server:{middlewareMode:true},appType:'spa'});app.use(vite.middlewares);}
+app.listen(Number(process.env.PORT||3000),'0.0.0.0',()=>console.log('Treasure Booths is running on port '+(process.env.PORT||3000)+'. Admin credentials are configured privately in the data directory.'));
